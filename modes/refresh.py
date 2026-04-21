@@ -214,6 +214,7 @@ def run_manual(config: Dict[str, Any], force: bool, dry_run: bool) -> int:
         print("\n=== REFRESH COST ===")
         for line in cost.summary_lines():
             print(line)
+        client.close()
         db.close()
 
     return 0 if result.get("new_version_id") or dry_run else 2

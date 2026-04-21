@@ -156,117 +156,119 @@ def run(
     claude_limiter = TokenBucket(rate_per_sec=50 / 60.0, capacity=50)
     cost = CostTracker()
     refreshes_this_run: List[str] = []
+    exit_code = 0
 
     try:
-        taxonomy_obj, taxonomy_version_id = _load_current_taxonomy(db, config["TAXONOMY_PATH"])
-    except FileNotFoundError as e:
-        print("ERROR: {}".format(e))
-        db.close()
-        return 2
-    except RuntimeError as e:
-        print("ERROR: {}".format(e))
-        db.close()
-        return 2
-    taxonomy_text = taxonomy_mod.format_for_prompt(taxonomy_obj)
-    print("Loaded taxonomy version {}".format(taxonomy_version_id))
+        try:
+            taxonomy_obj, taxonomy_version_id = _load_current_taxonomy(db, config["TAXONOMY_PATH"])
+        except (FileNotFoundError, RuntimeError) as e:
+            print("ERROR: {}".format(e))
+            exit_code = 2
+            return exit_code
 
-    print("Loading input CSV: {}".format(input_path))
-    rows = load_input_csv(input_path)
-    print("  {} unique companies".format(len(rows)))
+        taxonomy_text = taxonomy_mod.format_for_prompt(taxonomy_obj)
+        print("Loaded taxonomy version {}".format(taxonomy_version_id))
 
-    done = db.get_classified_or_attempted()
-    todo = [r for r in rows if r["company_number"] not in done]
-    if limit:
-        todo = todo[:limit]
-    print("Already done: {}. To process: {}.".format(len(done), len(todo)))
-    if not todo:
-        print("Nothing to do.")
+        print("Loading input CSV: {}".format(input_path))
+        rows = load_input_csv(input_path)
+        print("  {} unique companies".format(len(rows)))
+
+        done = db.get_classified_or_attempted()
+        todo = [r for r in rows if r["company_number"] not in done]
+        if limit:
+            todo = todo[:limit]
+        print("Already done: {}. To process: {}.".format(len(done), len(todo)))
+        if not todo:
+            print("Nothing to do.")
+            if output_path:
+                n = _export_csv(db, output_path)
+                print("Exported {} rows to {}".format(n, output_path))
+            return exit_code
+
+        companies_since_refresh = 0
+        processed_this_run = 0
+
+        # Process in checkpoints so we can drain workers and run refresh between chunks.
+        pbar = tqdm(total=len(todo), desc="classify")
+        i = 0
+        while i < len(todo):
+            chunk = todo[i : i + CHECKPOINT_EVERY]
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = [
+                    ex.submit(
+                        _worker, r, db, client, config,
+                        taxonomy_obj, taxonomy_text, taxonomy_version_id,
+                        serper_limiter, claude_limiter, cost,
+                    )
+                    for r in chunk
+                ]
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        log.warning("worker error: %s", e)
+                        cost.inc_error()
+                    processed_this_run += 1
+                    companies_since_refresh += 1
+                    pbar.update(1)
+                    if processed_this_run % 100 == 0:
+                        counts = db.summary_counts()
+                        pbar.set_postfix(
+                            domain="{:.0%}".format((counts["domain_found"] or 0) / max(counts["total"], 1)),
+                            classified="{:.0%}".format((counts["classified"] or 0) / max(counts["total"], 1)),
+                            unclassified="{:.0%}".format((counts["unclassified"] or 0) / max(counts["total"], 1)),
+                        )
+
+            # Checkpoint: refresh?
+            trigger = _check_refresh_triggers(db, companies_since_refresh, config)
+            if trigger:
+                pbar.write("\nRefresh trigger: {}. Running taxonomy refresh...".format(trigger))
+                result = refresh_mod.run(
+                    db=db, client=client, config=config,
+                    trigger=trigger, cost=cost, claude_limiter=claude_limiter,
+                    force=False, dry_run=False,
+                )
+                if result.get("new_version_id"):
+                    taxonomy_obj = result["taxonomy"]
+                    taxonomy_text = taxonomy_mod.format_for_prompt(taxonomy_obj)
+                    taxonomy_version_id = result["new_version_id"]
+                    companies_since_refresh = 0
+                    refreshes_this_run.append(trigger)
+                    pbar.write("Resumed with taxonomy v{}.".format(taxonomy_version_id))
+                else:
+                    pbar.write("Refresh did not produce a new taxonomy: {}".format(result.get("reason")))
+            i += CHECKPOINT_EVERY
+
+        pbar.close()
+
         if output_path:
             n = _export_csv(db, output_path)
             print("Exported {} rows to {}".format(n, output_path))
+
+        elapsed = time.time() - t0
+        counts = db.summary_counts()
+        print("\n=== CLASSIFY SUMMARY ===")
+        for line in cost.summary_lines():
+            print(line)
+        print("Elapsed: {:.1f}s".format(elapsed))
+        if cost.companies_processed:
+            print("Avg per company: {:.2f}s".format(elapsed / cost.companies_processed))
+        print("")
+        print("DB totals: total={}, domain_found={}, services={}, classified={}, "
+              "unclassified={}, errored={}".format(
+                  counts["total"], counts["domain_found"], counts["services_extracted"],
+                  counts["classified"], counts["unclassified"], counts["errored"],
+              ))
+        print("\nTop sectors:")
+        for sector, n in db.sector_counts(limit=10):
+            print("  {:40s} {}".format(sector, n))
+        print("\nRefreshes this run: {}{}".format(
+            len(refreshes_this_run),
+            " (" + ", ".join(refreshes_this_run) + ")" if refreshes_this_run else "",
+        ))
+
+    finally:
+        client.close()
         db.close()
-        return 0
 
-    companies_since_refresh = 0
-    processed_this_run = 0
-
-    # Process in checkpoints so we can drain workers and run refresh between chunks.
-    pbar = tqdm(total=len(todo), desc="classify")
-    i = 0
-    while i < len(todo):
-        chunk = todo[i : i + CHECKPOINT_EVERY]
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = [
-                ex.submit(
-                    _worker, r, db, client, config,
-                    taxonomy_obj, taxonomy_text, taxonomy_version_id,
-                    serper_limiter, claude_limiter, cost,
-                )
-                for r in chunk
-            ]
-            for f in as_completed(futures):
-                try:
-                    f.result()
-                except Exception as e:
-                    log.warning("worker error: %s", e)
-                    cost.inc_error()
-                processed_this_run += 1
-                companies_since_refresh += 1
-                pbar.update(1)
-                if processed_this_run % 100 == 0:
-                    counts = db.summary_counts()
-                    pbar.set_postfix(
-                        domain="{:.0%}".format((counts["domain_found"] or 0) / max(counts["total"], 1)),
-                        classified="{:.0%}".format((counts["classified"] or 0) / max(counts["total"], 1)),
-                        unclassified="{:.0%}".format((counts["unclassified"] or 0) / max(counts["total"], 1)),
-                    )
-
-        # Checkpoint: refresh?
-        trigger = _check_refresh_triggers(db, companies_since_refresh, config)
-        if trigger:
-            pbar.write("\nRefresh trigger: {}. Running taxonomy refresh...".format(trigger))
-            result = refresh_mod.run(
-                db=db, client=client, config=config,
-                trigger=trigger, cost=cost, claude_limiter=claude_limiter,
-                force=False, dry_run=False,
-            )
-            if result.get("new_version_id"):
-                taxonomy_obj = result["taxonomy"]
-                taxonomy_text = taxonomy_mod.format_for_prompt(taxonomy_obj)
-                taxonomy_version_id = result["new_version_id"]
-                companies_since_refresh = 0
-                refreshes_this_run.append(trigger)
-                pbar.write("Resumed with taxonomy v{}.".format(taxonomy_version_id))
-            else:
-                pbar.write("Refresh did not produce a new taxonomy: {}".format(result.get("reason")))
-        i += CHECKPOINT_EVERY
-
-    pbar.close()
-
-    if output_path:
-        n = _export_csv(db, output_path)
-        print("Exported {} rows to {}".format(n, output_path))
-
-    elapsed = time.time() - t0
-    counts = db.summary_counts()
-    print("\n=== CLASSIFY SUMMARY ===")
-    for line in cost.summary_lines():
-        print(line)
-    print("Elapsed: {:.1f}s".format(elapsed))
-    if cost.companies_processed:
-        print("Avg per company: {:.2f}s".format(elapsed / cost.companies_processed))
-    print("")
-    print("DB totals: total={}, domain_found={}, services={}, classified={}, unclassified={}, errored={}".format(
-        counts["total"], counts["domain_found"], counts["services_extracted"],
-        counts["classified"], counts["unclassified"], counts["errored"],
-    ))
-    print("\nTop sectors:")
-    for sector, n in db.sector_counts(limit=10):
-        print("  {:40s} {}".format(sector, n))
-    print("\nRefreshes this run: {}{}".format(
-        len(refreshes_this_run),
-        " (" + ", ".join(refreshes_this_run) + ")" if refreshes_this_run else "",
-    ))
-
-    db.close()
-    return 0
+    return exit_code

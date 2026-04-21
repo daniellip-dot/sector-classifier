@@ -149,86 +149,90 @@ def run(
     serper_limiter = TokenBucket(rate_per_sec=30, capacity=30)
     claude_limiter = TokenBucket(rate_per_sec=50 / 60.0, capacity=50)
     cost = CostTracker()
+    exit_code = 0
 
-    print("Loading input CSV: {}".format(input_path))
-    rows = load_input_csv(input_path)
-    print("  {} unique companies".format(len(rows)))
+    try:
+        print("Loading input CSV: {}".format(input_path))
+        rows = load_input_csv(input_path)
+        print("  {} unique companies".format(len(rows)))
 
-    sample = _resolve_sample(db, rows, sample_size)
-    print("Sample size: {}".format(len(sample)))
+        sample = _resolve_sample(db, rows, sample_size)
+        print("Sample size: {}".format(len(sample)))
 
-    # Pass everything through — run_discover_for_company merges with any existing DB row
-    # and skips stages already completed, so resume is automatic.
-    to_do = sample
-    print("Running domain → scrape → services on {} companies (workers={})...".format(len(to_do), workers))
+        # Pass everything through — run_discover_for_company merges with any existing DB row
+        # and skips stages already completed, so resume is automatic.
+        to_do = sample
+        print("Running domain → scrape → services on {} companies (workers={})...".format(
+            len(to_do), workers))
 
-    def worker(row: Dict[str, Any]) -> Dict[str, Any]:
-        with db.lock:
-            cur = db.conn.execute(
-                "SELECT * FROM company_research WHERE company_number=?",
-                (row["company_number"],),
+        def worker(row: Dict[str, Any]) -> Dict[str, Any]:
+            with db.lock:
+                cur = db.conn.execute(
+                    "SELECT * FROM company_research WHERE company_number=?",
+                    (row["company_number"],),
+                )
+                existing_row = cur.fetchone()
+                existing = dict(existing_row) if existing_row else None
+            patch = run_discover_for_company(
+                row, client, config["HAIKU_MODEL"], config["SERPER_API_KEY"],
+                serper_limiter, claude_limiter, cost, existing=existing,
             )
-            existing_row = cur.fetchone()
-            existing = dict(existing_row) if existing_row else None
-        patch = run_discover_for_company(
-            row, client, config["HAIKU_MODEL"], config["SERPER_API_KEY"],
-            serper_limiter, claude_limiter, cost, existing=existing,
-        )
-        patch["sampled_for_discovery"] = 1
-        db.upsert_company(patch)
-        return patch
+            patch["sampled_for_discovery"] = 1
+            db.upsert_company(patch)
+            return patch
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(worker, r) for r in to_do]
-        with tqdm(total=len(futures), desc="discover") as pbar:
-            for f in as_completed(futures):
-                try:
-                    f.result()
-                except Exception as e:
-                    log.warning("worker error: %s", e)
-                    cost.inc_error()
-                pbar.update(1)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(worker, r) for r in to_do]
+            with tqdm(total=len(futures), desc="discover") as pbar:
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        log.warning("worker error: %s", e)
+                        cost.inc_error()
+                    pbar.update(1)
 
-    # Pull everything we extracted and send to Sonnet
-    rows_for_cluster = db.get_sampled_services()
-    cluster_input = [
-        {"company_number": n, "company_name": name, "services_description": sv}
-        for (n, name, sv, _spec) in rows_for_cluster
-    ]
-    print("Descriptions eligible for clustering: {}".format(len(cluster_input)))
+        # Pull everything we extracted and send to Sonnet
+        rows_for_cluster = db.get_sampled_services()
+        cluster_input = [
+            {"company_number": n, "company_name": name, "services_description": sv}
+            for (n, name, sv, _spec) in rows_for_cluster
+        ]
+        print("Descriptions eligible for clustering: {}".format(len(cluster_input)))
 
-    tax = _cluster(client, config["SONNET_MODEL"], cluster_input, claude_limiter, cost)
-    if not tax:
-        print("No taxonomy produced. Aborting.")
+        tax = _cluster(client, config["SONNET_MODEL"], cluster_input, claude_limiter, cost)
+        if not tax:
+            print("No taxonomy produced. Aborting.")
+            exit_code = 2
+        else:
+            ok, errors = taxonomy_mod.validate_taxonomy(tax)
+            if not ok:
+                print("Taxonomy validation failed:")
+                for e in errors:
+                    print("  - {}".format(e))
+                print("Saving the taxonomy anyway for inspection, but marking as unvalidated.")
+
+            version_id = taxonomy_mod.save_taxonomy(
+                db=db,
+                tax=tax,
+                taxonomy_path=config["TAXONOMY_PATH"],
+                history_dir=config["TAXONOMY_HISTORY_DIR"],
+                trigger="initial",
+                change_log=None,
+                company_count=len(cluster_input),
+                notes="validation_errors={}".format(len(errors)) if errors else "",
+            )
+            print("Saved taxonomy version {}".format(version_id))
+
+    finally:
+        elapsed = time.time() - t0
+        print("\n=== DISCOVER SUMMARY ===")
+        for line in cost.summary_lines():
+            print(line)
+        print("Elapsed: {:.1f}s".format(elapsed))
+        if cost.companies_processed:
+            print("Avg per company: {:.2f}s".format(elapsed / cost.companies_processed))
+        client.close()
         db.close()
-        return 2
 
-    ok, errors = taxonomy_mod.validate_taxonomy(tax)
-    if not ok:
-        print("Taxonomy validation failed:")
-        for e in errors:
-            print("  - {}".format(e))
-        print("Saving the taxonomy anyway for inspection, but marking as unvalidated.")
-
-    version_id = taxonomy_mod.save_taxonomy(
-        db=db,
-        tax=tax,
-        taxonomy_path=config["TAXONOMY_PATH"],
-        history_dir=config["TAXONOMY_HISTORY_DIR"],
-        trigger="initial",
-        change_log=None,
-        company_count=len(cluster_input),
-        notes="validation_errors={}".format(len(errors)) if errors else "",
-    )
-    print("Saved taxonomy version {}".format(version_id))
-
-    elapsed = time.time() - t0
-    print("\n=== DISCOVER SUMMARY ===")
-    for line in cost.summary_lines():
-        print(line)
-    print("Elapsed: {:.1f}s".format(elapsed))
-    if cost.companies_processed:
-        print("Avg per company: {:.2f}s".format(elapsed / cost.companies_processed))
-
-    db.close()
-    return 0
+    return exit_code
