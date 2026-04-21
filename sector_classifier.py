@@ -14,10 +14,30 @@ Subcommands:
 import argparse
 import logging
 import os
+import signal
 import sys
+import threading
+import traceback
 from typing import Any, Dict
 
 from dotenv import load_dotenv
+
+
+def _install_debug_signal_handler() -> None:
+    """SIGUSR1 → dump all thread stacks to stderr. Useful for diagnosing hangs."""
+    def _handler(sig, frame):
+        lines = ["\n=== SIGUSR1 THREAD DUMP ===\n"]
+        for tid, f in sys._current_frames().items():
+            name = "?"
+            for t in threading.enumerate():
+                if t.ident == tid:
+                    name = "{} (daemon={})".format(t.name, t.daemon)
+                    break
+            lines.append("--- Thread {} [{}] ---\n".format(tid, name))
+            lines.append("".join(traceback.format_stack(f)))
+        sys.stderr.write("".join(lines))
+        sys.stderr.flush()
+    signal.signal(signal.SIGUSR1, _handler)
 
 
 HERE = os.path.abspath(os.path.dirname(__file__))
@@ -264,6 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    _install_debug_signal_handler()
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
