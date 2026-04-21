@@ -57,16 +57,21 @@ class CostTracker:
         with self.lock:
             self.errors += 1
 
+    def _total_gbp_unlocked(self) -> float:
+        """Compute total cost WITHOUT acquiring self.lock (caller must already hold it)."""
+        return (
+            self.serper * COST_PER_SERPER
+            + self.haiku * COST_PER_HAIKU
+            + self.sonnet * COST_PER_SONNET
+        )
+
     def total_gbp(self) -> float:
         with self.lock:
-            return (
-                self.serper * COST_PER_SERPER
-                + self.haiku * COST_PER_HAIKU
-                + self.sonnet * COST_PER_SONNET
-            )
+            return self._total_gbp_unlocked()
 
     def summary_lines(self) -> List[str]:
         with self.lock:
+            total = self._total_gbp_unlocked()
             return [
                 "Companies processed:   {}".format(self.companies_processed),
                 "Domains found:         {}".format(self.domains_found),
@@ -74,7 +79,7 @@ class CostTracker:
                 "Serper queries:        {} (£{:.2f})".format(self.serper, self.serper * COST_PER_SERPER),
                 "Haiku calls:           {} (£{:.2f})".format(self.haiku, self.haiku * COST_PER_HAIKU),
                 "Sonnet calls:          {} (£{:.2f})".format(self.sonnet, self.sonnet * COST_PER_SONNET),
-                "Total spend:           £{:.2f}".format(self.total_gbp()),
+                "Total spend:           £{:.2f}".format(total),
             ]
 
 
