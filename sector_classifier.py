@@ -167,13 +167,12 @@ def cmd_retry_failed(args, cfg) -> int:
     _require(cfg, ["ANTHROPIC_API_KEY", "SERPER_API_KEY"])
     from lib.concurrency import Database, TokenBucket
     from modes._common import CostTracker, run_discover_for_company, classify_company_row
-    from lib import taxonomy as taxonomy_mod
-    import anthropic
+    from lib import llm, taxonomy as taxonomy_mod
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from tqdm import tqdm
 
     db = Database(cfg["DB_PATH"], cfg["SCHEMA_PATH"])
-    client = anthropic.Anthropic(api_key=cfg["ANTHROPIC_API_KEY"])
+    client = llm.make_client(cfg["ANTHROPIC_API_KEY"])
     serper_limiter = TokenBucket(rate_per_sec=30, capacity=30)
     claude_limiter = TokenBucket(rate_per_sec=50 / 60.0, capacity=50)
     cost = CostTracker()

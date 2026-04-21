@@ -200,7 +200,7 @@ def run(
 def run_manual(config: Dict[str, Any], force: bool, dry_run: bool) -> int:
     """Entry point for the CLI `refresh-taxonomy` command."""
     db = Database(config["DB_PATH"], config["SCHEMA_PATH"])
-    client = anthropic.Anthropic(api_key=config["ANTHROPIC_API_KEY"])
+    client = llm.make_client(config["ANTHROPIC_API_KEY"])
     claude_limiter = TokenBucket(rate_per_sec=50 / 60.0, capacity=50)
     cost = CostTracker()
 

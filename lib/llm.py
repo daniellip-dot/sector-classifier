@@ -6,6 +6,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 import anthropic
+import httpx
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -15,6 +16,21 @@ from tenacity import (
 
 
 log = logging.getLogger(__name__)
+
+
+def make_client(api_key: str) -> anthropic.Anthropic:
+    """Create an Anthropic client with httpx configured to avoid keepalive background threads.
+
+    By default httpx maintains a connection pool with a keepalive thread.  That
+    thread is not a daemon, so it prevents the Python process from exiting after
+    all work is done.  Setting max_keepalive_connections=0 and keepalive_expiry=0
+    disables the pool entirely — connections are closed immediately after each
+    request, no background thread is needed, and the process exits cleanly.
+    """
+    http_client = httpx.Client(
+        limits=httpx.Limits(max_keepalive_connections=0, keepalive_expiry=0),
+    )
+    return anthropic.Anthropic(api_key=api_key, http_client=http_client)
 
 
 class _LLMError(Exception):

@@ -145,7 +145,7 @@ def run(
     t0 = time.time()
 
     db = Database(config["DB_PATH"], config["SCHEMA_PATH"])
-    client = anthropic.Anthropic(api_key=config["ANTHROPIC_API_KEY"])
+    client = llm.make_client(config["ANTHROPIC_API_KEY"])
     serper_limiter = TokenBucket(rate_per_sec=30, capacity=30)
     claude_limiter = TokenBucket(rate_per_sec=50 / 60.0, capacity=50)
     cost = CostTracker()
