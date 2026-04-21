@@ -1,0 +1,13 @@
+.env
+venv/
+__pycache__/
+*.pyc
+data/*.db
+data/*.db-journal
+data/*.csv
+taxonomy/taxonomy.json
+taxonomy/taxonomy_history/*.json
+!data/.gitkeep
+!taxonomy/taxonomy_history/.gitkeep
+.DS_Store
+*.log

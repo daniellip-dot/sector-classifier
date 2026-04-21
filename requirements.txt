@@ -1,0 +1,7 @@
+requests
+pandas
+beautifulsoup4
+tqdm
+python-dotenv
+anthropic>=0.40.0
+tenacity
